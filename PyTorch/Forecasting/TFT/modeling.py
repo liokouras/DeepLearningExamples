@@ -24,6 +24,8 @@ if os.environ.get("TFT_SCRIPTING", False):
 else:
     from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
 
+from varuna import CutPoint
+
 class MaybeLayerNorm(nn.Module):
     def __init__(self, output_size, hidden_size, eps):
         super().__init__()
@@ -152,14 +154,14 @@ class TFTEmbedding(nn.Module):
         else:
             return None
 
-    def forward(self, x: Dict[str, Tensor]):
+    def forward(self, s_cat = None, s_cont = None, k_cat = None, k_cont = None, o_cat = None, o_cont = None, **x):
         # temporal/static categorical/continuous known/observed input 
-        s_cat_inp = x.get('s_cat', None)
-        s_cont_inp = x.get('s_cont', None)
-        t_cat_k_inp = x.get('k_cat', None)
-        t_cont_k_inp = x.get('k_cont', None)
-        t_cat_o_inp = x.get('o_cat', None)
-        t_cont_o_inp = x.get('o_cont', None)
+        s_cat_inp = s_cat
+        s_cont_inp = s_cont
+        t_cat_k_inp = k_cat
+        t_cont_k_inp = k_cont
+        t_cat_o_inp = o_cat
+        t_cont_o_inp = o_cont
         t_tgt_obs = x['target'] # Has to be present
 
         # Static inputs are expected to be equal for all timesteps
@@ -188,7 +190,9 @@ class TFTEmbedding(nn.Module):
         t_observed_tgt = torch.matmul(t_tgt_obs.unsqueeze(3).unsqueeze(4), self.t_tgt_embedding_vectors.unsqueeze(1)).squeeze(3)
         t_observed_tgt = t_observed_tgt + self.t_tgt_embedding_bias
 
-        return s_inp, t_known_inp, t_observed_inp, t_observed_tgt
+        ret_vals = [s_inp, t_known_inp, t_observed_inp, t_observed_tgt]
+
+        return ret_vals
 
 class VariableSelectionNetwork(nn.Module):
     def __init__(self, config, num_inputs):
@@ -197,15 +201,18 @@ class VariableSelectionNetwork(nn.Module):
         self.var_grns = nn.ModuleList([GRN(config.hidden_size, config.hidden_size, dropout=config.dropout) for _ in range(num_inputs)])
 
     def forward(self, x: Tensor, context: Optional[Tensor] = None):
-        Xi = x.reshape(*x.shape[:-2], -1)
-        grn_outputs = self.joint_grn(Xi, c=context)
-        sparse_weights = F.softmax(grn_outputs, dim=-1)
-        transformed_embed_list = [m(x[...,i,:]) for i, m in enumerate(self.var_grns)]
-        transformed_embed = torch.stack(transformed_embed_list, dim=-1)
-        #the line below performs batched matrix vector multiplication
-        #for temporal features it's bthf,btf->bth
-        #for static features it's bhf,bf->bh
-        variable_ctx = torch.matmul(transformed_embed, sparse_weights.unsqueeze(-1)).squeeze(-1)
+        variable_ctx = None
+        sparse_weights = None
+        if x is not None:
+            Xi = x.reshape(*x.shape[:-2], -1)
+            grn_outputs = self.joint_grn(Xi, c=context)
+            sparse_weights = F.softmax(grn_outputs, dim=-1)
+            transformed_embed_list = [m(x[...,i,:]) for i, m in enumerate(self.var_grns)]
+            transformed_embed = torch.stack(transformed_embed_list, dim=-1)
+            #the line below performs batched matrix vector multiplication
+            #for temporal features it's bthf,btf->bth
+            #for static features it's bhf,bf->bh
+            variable_ctx = torch.matmul(transformed_embed, sparse_weights.unsqueeze(-1)).squeeze(-1)
 
         return variable_ctx, sparse_weights
 
@@ -225,8 +232,8 @@ class StaticCovariateEncoder(nn.Module):
         # state_h context
         cs, ce, ch, cc = tuple(m(variable_ctx) for m in self.context_grns)
 
-        return cs, ce, ch, cc
-
+        ret_vals = [cs, ce, ch, cc]
+        return ret_vals
 
 class InterpretableMultiHeadAttention(nn.Module):
     def __init__(self, config):
@@ -297,6 +304,7 @@ class TemporalFusionTransformer(nn.Module):
                                   config.hidden_size,
                                   context_hidden_size=config.hidden_size, 
                                   dropout=config.dropout)
+
         self.attention = InterpretableMultiHeadAttention(config)
         self.attention_gate = GLU(config.hidden_size, config.hidden_size)
         self.attention_ln = LayerNorm(config.hidden_size, eps=1e-3)
@@ -310,52 +318,112 @@ class TemporalFusionTransformer(nn.Module):
 
         self.quantile_proj = nn.Linear(config.hidden_size, len(config.quantiles))
 
-    def forward(self, x: Dict[str, Tensor]) -> Tensor:
-        s_inp, t_known_inp, t_observed_inp, t_observed_tgt = self.embedding(x)
+        self.cutpoint = CutPoint()
+
+
+    def forward(self, **x):
+        embeds = self.embedding(**x)
+        if embeds:
+            s_inp, t_known_inp, t_observed_inp, t_observed_tgt = embeds
+        else:
+            s_inp = None
+            t_known_inp = None
+            t_observed_inp = None
+            t_observed_tgt = None
+
+        # BAZI: place CP here that passes embeddings through
 
         # Static context
-        cs, ce, ch, cc = self.static_encoder(s_inp)
-        ch, cc = ch.unsqueeze(0), cc.unsqueeze(0) #lstm initial states
+        cntxs = self.static_encoder(s_inp)
+        if cntxs:
+            cs, ce, ch, cc = cntxs
+            ch, cc = ch.unsqueeze(0), cc.unsqueeze(0) #lstm initial states
+        else:
+            cs = None
+            ce = None
+            ch = None
+            cc = None
 
         # Temporal input
-        _historical_inputs = [t_known_inp[:,:self.encoder_length,:], t_observed_tgt[:,:self.encoder_length,:]]
-        if t_observed_inp is not None:
-            _historical_inputs.insert(0,t_observed_inp[:,:self.encoder_length,:])
+        if t_known_inp is not None:
+            _historical_inputs = [t_known_inp[:,:self.encoder_length,:], t_observed_tgt[:,:self.encoder_length,:]]
+            if t_observed_inp is not None:
+                _historical_inputs.insert(0,t_observed_inp[:,:self.encoder_length,:])
 
-        historical_inputs = torch.cat(_historical_inputs, dim=-2)
-        future_inputs = t_known_inp[:, self.encoder_length:]
+            historical_inputs = torch.cat(_historical_inputs, dim=-2)
+            future_inputs = t_known_inp[:, self.encoder_length:]
+        else:
+            historical_inputs = None
+            future_inputs = None
+
+        # BAZI: place CP here that passes cntxs and historical/future inputs through
 
         # Encoders
-        historical_features, _ = self.history_vsn(historical_inputs, cs)
-        history, state = self.history_encoder(historical_features, (ch, cc))
-        future_features, _ = self.future_vsn(future_inputs, cs)
-        future, _ = self.future_encoder(future_features, state)
+        if historical_inputs is not None:
+            historical_features, _ = self.history_vsn(historical_inputs, cs)
+            history, state = self.history_encoder(historical_features, (ch, cc))
+            future_features, _ = self.future_vsn(future_inputs, cs)
+            future, _ = self.future_encoder(future_features, state)
+        else:
+            historical_features = None
+            history = None
+            state = None
+            future_features = None
+            future = None
         torch.cuda.synchronize() # this call gives perf boost for unknown reasons
 
+        # BAZI place CP here that passes ce, hist/future, hist/future features
+
         # skip connection
-        input_embedding = torch.cat([historical_features, future_features], dim=1)
-        temporal_features = torch.cat([history, future], dim=1)
-        temporal_features = self.input_gate(temporal_features)
-        temporal_features = temporal_features + input_embedding
-        temporal_features = self.input_gate_ln(temporal_features)
+        if historical_features is not None:
+            input_embedding = torch.cat([historical_features, future_features], dim=1)
+            temporal_features = torch.cat([history, future], dim=1)
+            temporal_features = self.input_gate(temporal_features)
+            temporal_features = temporal_features + input_embedding
+            temporal_features = self.input_gate_ln(temporal_features)
+        else:
+            input_embedding = None
+            temporal_features = None
+
+        # BAZI place CP here that passes temporal_features, ce
 
         # Static enrichment
         enriched = self.enrichment_grn(temporal_features, c=ce)
 
-        # Temporal self attention
-        x, _ = self.attention(enriched, mask_future_timesteps=True)
+        # BAZI place CP here that passes temporal_features, encriched.
 
+        # Temporal self attention
+        if enriched is not None:
+            x, _ = self.attention(enriched, mask_future_timesteps=True)
+
+        # BAZI place CP here that passes temporal_features, encriched, x
+        # SHAPE: 1024, 192, 128
+        outs = None
+        if temporal_features is not None:
+            outs = torch.cat((temporal_features, enriched, x), dim=2)
+        outs = self.cutpoint(outs)
+        if outs is not None:
+            _, _, splitshape = outs.shape
+            splitshape = int(splitshape/3)
+            temporal_features, enriched, x = torch.split(outs, splitshape, dim=2)
+        
         # Don't compute hictorical quantiles
         x = x[:, self.encoder_length:, :]
         temporal_features = temporal_features[:, self.encoder_length:, :]
         enriched = enriched[:, self.encoder_length:, :]
 
+        # BAZI place CP here that passes temporal_features, enriched, x
+
         x = self.attention_gate(x)
         x = x + enriched
         x = self.attention_ln(x)
 
+        # BAZI place CP here that passes temporal_features, x
+
         # Position-wise feed-forward
         x = self.positionwise_grn(x)
+
+        # BAZI place CP here that passes temporal_features, x
 
         # Final skip connection
         x = self.decoder_gate(x)
@@ -364,4 +432,5 @@ class TemporalFusionTransformer(nn.Module):
 
         out = self.quantile_proj(x)
 
+        # OUTPUT HAS SHAPE torch.Size([1024, 24, 3]) !!!
         return out

@@ -42,6 +42,25 @@ from utils import PerformanceMeter
 import gpu_affinity
 from ema import ModelEma
 
+from varuna import Varuna, get_varuna_config, get_this_rank_config_varuna
+
+# Inferred from 'BertForPreTrainingWithCriterion' in Varuna patch
+# shape of tensors in batch is: torch.Size([4, 192, 1]) or for k_cont: torch.Size([4, 192, 3])
+class TFTwithCriterion(torch.nn.Module):
+    def __init__(self, config):
+        super(TFTwithCriterion, self).__init__()
+        self.model = TemporalFusionTransformer(config)
+        self.criterion = QuantileLoss(config) #.cuda() BAZI: commented out cuda - varuna takes care of this?
+        self.encoder_length = config.encoder_length
+
+    def forward(self, **batch): # BAZI TODO batching into dict !
+        predictions = self.model(**batch)
+        targets = batch['target'][:,self.encoder_length:,:]
+        p_losses = self.criterion(predictions, targets)
+        loss = p_losses.sum()
+        return loss
+
+# BAZI: return both the data sets and the dataloaders.
 def load_dataset(args, config):
     train_split = TFTBinaryDataset(os.path.join(args.data_path, 'train.bin'), config)
     train_split = sample_data(train_split, args.sample_data[0])
@@ -70,7 +89,7 @@ def load_dataset(args, config):
     print_once(f'Valid split length: {len(valid_split)}')
     print_once(f'Test split length: {len(test_split)}')
 
-    return train_loader, valid_loader, test_loader
+    return train_split, valid_split, test_split, train_loader, valid_loader, test_loader
 
 def print_once(*args, **kwargs):
     if not dist.is_initialized() or dist.get_rank() == 0:
@@ -79,14 +98,19 @@ def print_once(*args, **kwargs):
 
 def main(args):
     ### INIT DISTRIBUTED
-    args.distributed_world_size = int(os.environ.get('WORLD_SIZE', 1))
+    args.distributed_world_size = int(os.environ.get('WORLD_SIZE', 1)) # BAZI TODO: get these from args?
     args.local_rank = int(os.environ.get('LOCAL_RANK', 0))
     if args.distributed_world_size > 1:
-        dist.init_process_group(backend='nccl', init_method='env://')
+        # dist.init_process_group(backend='nccl', init_method='env://')
+        dist.init_process_group(backend='gloo' if args.varuna else 'nccl', init_method='env://')
         print_once(f'Distributed training with {args.distributed_world_size} GPUs')
         args.distributed_rank = dist.get_rank()
         torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
         torch.cuda.synchronize()
+
+    if args.varuna:
+        args.grad_accumulation = 1
 
     # Enable CuDNN autotuner
     nproc_per_node = torch.cuda.device_count()
@@ -113,20 +137,57 @@ def main(args):
 
     dllogger.log(step='HPARAMS', data={**vars(args), **vars(config)}, verbosity=1)
 
-    model = TemporalFusionTransformer(config).cuda()
-    if args.ema_decay:
+    # BAZI BATCHING
+    # train_loader, valid_loader, test_loader = load_dataset(args, config) # BAZI TODO: look at patch for shared_files bit
+    train_split, valid_split, test_split, train_loader, valid_loader, test_loader = load_dataset(args, config)
+
+    def get_dict_batch(batch, device=None):
+        # if device is not None:
+        #      batch = [t.to(device) for t in batch] 
+        batch = dict({key: tensor.to(device) if tensor.numel() else None for key, tensor in batch.items()})
+        return batch
+
+    # "prepare model and optimizer" function in Bert...
+    # Build model on cpu.
+    model = TFTwithCriterion(config)
+
+    if args.varuna:
+        def get_batch_fn(size, device=None):
+            batch = next(iter(DataLoader(train_split, batch_size=size)))
+            return get_dict_batch(batch, device=device)
+
+        pipeline_parallel_size, data_parallel_size = get_varuna_config(args.stage_to_rank_map)
+        global_batch_size = args.batch_size * data_parallel_size
+
+        # BAZI TODO: figure out shared weights
+        shared_weights = [] # [("model.bert.embeddings.word_embeddings.weight", "model.cls.predictions.decoder.weight")] 
+        
+        model = Varuna(model, args.stage_to_rank_map, get_batch_fn, global_batch_size, 
+            args.chunk_size, args.stage_to_cut, fp16=False, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)
+    
+        if args.profiling:
+            model = Profiler(model, get_batch_fn, fp16=args.fp16, device = args.local_rank, from_cache=True, out_folder=args.save, add_to_existing=True)
+        
+    elif args.ema_decay:
         model_ema = ModelEma(model, decay=args.ema_decay)
-
-    print_once('Model params: {}'.format(sum(p.numel() for p in model.parameters())))
-    criterion = QuantileLoss(config).cuda()
+        
     optimizer = FusedAdam(model.parameters(), lr=args.lr)
-    if args.use_amp:
-        model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic")
-    if args.distributed_world_size > 1:
-        #model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-        model = DDP(model)
 
-    train_loader, valid_loader, test_loader = load_dataset(args, config)
+    if not args.varuna:
+        criterion = QuantileLoss(config).cuda()
+        if args.use_amp: # varuna handles mixed precision
+            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic")
+        if args.distributed_world_size > 1: # varuna handles distributed training
+            #model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+            model = DDP(model)
+
+    if args.varuna:
+        # BAZI TODO: init_loss_scale = args.init_loss_scale??
+        model.set_optimizer(optimizer, loss_scale="dynamic")
+
+    if args.varuna and args.profiling:
+        profile = model.profile_all(list(range(1,16))) 
+        return
 
     global_step = 0
     perf_meter = PerformanceMeter(benchmark_mode=not args.disable_benchmark)
@@ -138,24 +199,29 @@ def main(args):
         model.train() 
         for local_step, batch in enumerate(train_loader):
             perf_meter.reset_current_lap()
-            batch = {key: tensor.cuda() if tensor.numel() else None for key, tensor in batch.items()}
-            predictions = model(batch)
-            targets = batch['target'][:,config.encoder_length:,:]
-            p_losses = criterion(predictions, targets)
-            loss = p_losses.sum()
 
-            if args.use_amp:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
+            batch = get_dict_batch(batch, device=device)
+            
+            if args.varuna:
+                loss, overflow, grad_norm = model.step(batch)
+                p_losses = torch.tensor(loss) # BAZI TODO: is this the right variable? it will be allreduced...
+                divisor = 1
             else:
-                loss.backward()
+                loss = model(batch)
+                if args.use_amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
+                    
             if not args.grad_accumulation or (global_step+1) % args.grad_accumulation == 0:
-                if args.clip_grad:
+                if args.clip_grad: # BAZI TODO do anything with varuna here ??
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                optimizer.step()
-                optimizer.zero_grad()
-                if args.ema_decay:
-                    model_ema.update(model)
+                if not args.varuna: 
+                    optimizer.step() 
+                    optimizer.zero_grad()
+                    if args.ema_decay:
+                        model_ema.update(model)
 
             if args.distributed_world_size > 1:
                 dist.all_reduce(p_losses)
@@ -166,11 +232,12 @@ def main(args):
             ips = perf_meter.update(args.batch_size * args.distributed_world_size,
                     exclude_from_total=local_step in [0, len(train_loader)-1])
 
-            log_dict = {'P10':p_losses[0].item(), 'P50':p_losses[1].item(), 'P90':p_losses[2].item(), 'loss': loss.item(), 'items/s':ips}
+            # log_dict = {'P10':p_losses[0].item(), 'P50':p_losses[1].item(), 'P90':p_losses[2].item(), 'loss': loss.item(), 'items/s':ips}
+            log_dict = {'loss': loss.item(), 'items/s':ips}
             dllogger.log(step=global_step, data=log_dict, verbosity=1)
             global_step += 1
 
-        validate(args, config, model_ema if args.ema_decay else model, criterion, valid_loader, global_step)
+        validate(args, config, model_ema if args.ema_decay else model, model.criterion, valid_loader, global_step)
 
         if validate.early_stop_c >= args.early_stopping:
             print_once('Early stopping')
@@ -284,6 +351,16 @@ if __name__ == '__main__':
     parser.add_argument("--ema_decay", type=float, default=0.0, help='Use exponential moving average')
     parser.add_argument("--disable_benchmark", action='store_true', help='Disable benchmarking mode')
 
+    # varuna args
+    parser.add_argument("--varuna", action='store_true', default=False, help="Enable varuna pipeline training")
+    parser.add_argument("--stage_to_rank_map", type=str, default=None, help="stage to rank map of Varuna model")
+    parser.add_argument("--chunk_size", type=int,default=None, help="number of microbatches for pipeline")
+    parser.add_argument("--rank", type=int, default=-1,  help="global rank passed by varuna launcher")
+    parser.add_argument("--resume_step", type=int, default=None, help="Iteration to resume training, given by varuna morphing")
+    parser.add_argument("--profiling", action='store_true', help="whether to run profiling for Varuna")
+    parser.add_argument("--stage_to_cut", type=str, default=None, help="stage to cutpoint map of Varuna model")
+    parser.add_argument("--local_rank", type=int, default=os.getenv('LOCAL_RANK', -1), help="local_rank for distributed training on gpus")
+    parser.add_argument("--batch-size", type=int, default=None, help = "per-process batch size given by varuna") # BAZI TODO: not to be conflated w batch_size...  
 
     ARGS = parser.parse_args()
     main(ARGS)
